@@ -1,6 +1,10 @@
 import { GoogleGenAI } from "@google/genai";
 import { NextRequest, NextResponse } from "next/server";
 
+// Allow this function to run for up to 60 seconds on Vercel (Hobby plan limit)
+export const maxDuration = 60;
+export const dynamic = 'force-dynamic';
+
 // Initialize Gemini API with the SERVER-SIDE key
 const apiKey = process.env.GEMINI_API_KEY;
 const ai = apiKey ? new GoogleGenAI({ apiKey }) : null;

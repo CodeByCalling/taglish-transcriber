@@ -1,10 +1,11 @@
+
 "use client";
 
 import React, { useState, useCallback, useRef } from 'react';
 import { UploadIcon, AudioFileIcon, SpinnerIcon, ErrorIcon, CopyIcon, CheckIcon, CancelIcon, DownloadIcon, LockIcon } from '../components/icons';
 
 // --- Constants ---
-const CHUNK_DURATION_SECONDS = 720; 
+const CHUNK_DURATION_SECONDS = 120; // Reduced to 2 mins for Vercel limits
 const CHUNK_OVERLAP_SECONDS = 10;
 
 // --- Audio Utility Functions ---
@@ -72,7 +73,8 @@ const getAudioDuration = (file: File): Promise<number> => {
     });
 };
 
-const sliceAudio = async (file: File): Promise<Blob[]> => {
+// Updated to accept an onProgress callback
+const sliceAudio = async (file: File, onProgress: (percent: number) => void): Promise<Blob[]> => {
   const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
   try {
       const fileBuffer = await file.arrayBuffer();
@@ -107,6 +109,10 @@ const sliceAudio = async (file: File): Promise<Blob[]> => {
         const wavBlob = audioBufferToWav(renderedBuffer);
         chunks.push(wavBlob);
 
+        // Report Progress (Slicing is roughly 0-100% of this phase)
+        const percent = Math.min(100, Math.round((endTime / duration) * 100));
+        onProgress(percent);
+
         currentTime = endTime - CHUNK_OVERLAP_SECONDS;
         if (currentTime >= duration) break;
       }
@@ -116,13 +122,29 @@ const sliceAudio = async (file: File): Promise<Blob[]> => {
   }
 };
 
+// Helper to format seconds into "1m 30s"
+const formatTimeRemaining = (seconds: number) => {
+    if (seconds < 60) return `${Math.ceil(seconds)}s`;
+    const mins = Math.floor(seconds / 60);
+    const secs = Math.ceil(seconds % 60);
+    return `${mins}m ${secs}s`;
+};
+
 type AppMode = 'single' | 'batch';
+
+interface ProgressStats {
+    phase: 'Preparing' | 'Uploading' | 'Slicing' | 'Transcribing';
+    percent: number;
+    currentChunk: number;
+    totalChunks: number;
+    etaSeconds: number | null;
+    detail?: string;
+}
 
 export default function Home() {
     const [isAuthenticated, setIsAuthenticated] = useState<boolean>(false);
     const [accessCodeInput, setAccessCodeInput] = useState<string>("");
     const [authError, setAuthError] = useState<string | null>(null);
-    // Store access code to send to backend for verification
     const [storedAccessCode, setStoredAccessCode] = useState<string>(""); 
 
     const [mode, setMode] = useState<AppMode>('single');
@@ -136,12 +158,12 @@ export default function Home() {
     const [isLoading, setIsLoading] = useState<boolean>(false);
     const [error, setError] = useState<string | null>(null);
     const [copied, setCopied] = useState<boolean>(false);
-    const [progress, setProgress] = useState<{ current: number; total: number; detail?: string } | null>(null);
-    const [statusMessage, setStatusMessage] = useState<string>('');
+    
+    // NEW: Detailed Progress State
+    const [progressStats, setProgressStats] = useState<ProgressStats | null>(null);
     
     const abortControllerRef = useRef<AbortController | null>(null);
 
-    // This calls the Next.js API route instead of Gemini directly
     const callBackendAPI = async (audioData: string, mimeType: string) => {
         const response = await fetch('/api/transcribe', {
             method: 'POST',
@@ -150,7 +172,7 @@ export default function Home() {
                 audioData,
                 mimeType,
                 speakerNames,
-                accessCode: storedAccessCode // Send code to server for validation
+                accessCode: storedAccessCode
             })
         });
 
@@ -165,8 +187,6 @@ export default function Home() {
 
     const handleLogin = (e: React.FormEvent) => {
         e.preventDefault();
-        // In a real app, we might verify against an API here, 
-        // but for now we store it and let the transcription API validate it.
         if (accessCodeInput.length > 0) {
             setIsAuthenticated(true);
             setStoredAccessCode(accessCodeInput);
@@ -250,7 +270,13 @@ export default function Home() {
         setIsLoading(true);
         setError(null);
         setTranscription(null);
-        setProgress(null);
+        setProgressStats({ 
+            phase: 'Preparing', 
+            percent: 0, 
+            currentChunk: 0, 
+            totalChunks: 0, 
+            etaSeconds: null 
+        });
         
         abortControllerRef.current = new AbortController();
         const signal = abortControllerRef.current.signal;
@@ -274,33 +300,35 @@ export default function Home() {
         } finally {
             if (!signal.aborted) {
                 setIsLoading(false);
-                setProgress(null);
-                setTimeout(() => setStatusMessage(prev => prev.includes('cancelled') ? prev : ''), 3000);
+                setProgressStats(null);
             }
         }
     };
 
     const processSingleFile = async (file: File, signal: AbortSignal) => {
-        setStatusMessage('Analyzing audio file...');
-        const duration = await getAudioDuration(file);
+        setProgressStats({ phase: 'Slicing', percent: 0, currentChunk: 0, totalChunks: 0, etaSeconds: null });
         
+        const duration = await getAudioDuration(file);
         if (signal.aborted) return;
 
         if (duration < CHUNK_DURATION_SECONDS && duration > 0) {
-            setStatusMessage('Transcribing audio (Single pass)...');
+            // Short File
+            setProgressStats({ phase: 'Transcribing', percent: 10, currentChunk: 1, totalChunks: 1, etaSeconds: null });
             const { mimeType, data } = await fileToBase64(file);
             if (signal.aborted) return;
 
             const result = await callBackendAPI(data, mimeType);
             if (signal.aborted) return;
 
+            setProgressStats({ phase: 'Transcribing', percent: 100, currentChunk: 1, totalChunks: 1, etaSeconds: 0 });
             setTranscription(result);
-            setStatusMessage('Transcription complete!');
         } else {
-            setStatusMessage('Processing long audio file (resampling & slicing)...');
+            // Long File - Slicing
             let audioChunks: Blob[] = [];
             try {
-                audioChunks = await sliceAudio(file);
+                audioChunks = await sliceAudio(file, (percent) => {
+                    setProgressStats(prev => prev ? { ...prev, phase: 'Slicing', percent: percent } : null);
+                });
             } catch (e) {
                 throw new Error("Failed to process audio file.");
             }
@@ -309,16 +337,38 @@ export default function Home() {
 
             const totalChunks = audioChunks.length;
             const transcriptions: string[] = [];
+            const startTime = Date.now();
             
             for (let i = 0; i < totalChunks; i++) {
                 if (signal.aborted) break;
 
+                // Calculate Progress
+                const completed = i;
+                const remaining = totalChunks - completed;
+                
+                // Estimate time
+                let eta = null;
+                if (i > 0) {
+                    const elapsedMs = Date.now() - startTime;
+                    const avgMsPerChunk = elapsedMs / i;
+                    const remainingMs = avgMsPerChunk * remaining;
+                    eta = remainingMs / 1000;
+                }
+
+                // Percent for the whole process (Slicing is done, now Transcribing is 0-100%)
+                const percent = Math.round((i / totalChunks) * 100);
+
+                setProgressStats({ 
+                    phase: 'Transcribing', 
+                    percent, 
+                    currentChunk: i + 1, 
+                    totalChunks, 
+                    etaSeconds: eta 
+                });
+
                 const chunk = audioChunks[i];
                 const chunkFile = new File([chunk], `chunk-${i + 1}.wav`, { type: 'audio/wav' });
                 
-                setStatusMessage(`Transcribing part ${i + 1} of ${totalChunks}...`);
-                setProgress({ current: i + 1, total: totalChunks });
-
                 const { mimeType, data } = await fileToBase64(chunkFile);
                 const result = await callBackendAPI(data, mimeType);
                 
@@ -327,23 +377,39 @@ export default function Home() {
                 transcriptions.push(result);
                 setTranscription(transcriptions.join('\n\n---\n\n'));
             }
-            
-            if (!signal.aborted) setStatusMessage('Transcription complete!');
         }
     };
 
     const processBatchFiles = async (files: File[], signal: AbortSignal) => {
         const totalFiles = files.length;
         let cumulativeTranscription = "";
+        const startTime = Date.now();
 
         for (let i = 0; i < totalFiles; i++) {
             if (signal.aborted) break;
             
             const file = files[i];
             const fileName = file.name;
+            
+             // Calculate ETA
+             let eta = null;
+             if (i > 0) {
+                 const elapsedMs = Date.now() - startTime;
+                 const avgMsPerChunk = elapsedMs / i;
+                 const remainingMs = avgMsPerChunk * (totalFiles - i);
+                 eta = remainingMs / 1000;
+             }
+             
+             const percent = Math.round((i / totalFiles) * 100);
 
-            setStatusMessage(`Processing file ${i + 1} of ${totalFiles}: ${fileName}`);
-            setProgress({ current: i + 1, total: totalFiles, detail: fileName });
+            setProgressStats({ 
+                phase: 'Transcribing', 
+                percent, 
+                currentChunk: i + 1, 
+                totalChunks: totalFiles, 
+                etaSeconds: eta,
+                detail: fileName
+            });
 
             const { mimeType, data } = await fileToBase64(file);
             const result = await callBackendAPI(data, mimeType);
@@ -355,8 +421,6 @@ export default function Home() {
             
             setTranscription(cumulativeTranscription.trim());
         }
-
-        if (!signal.aborted) setStatusMessage('Batch transcription complete!');
     };
 
     const handleCancel = () => {
@@ -364,8 +428,7 @@ export default function Home() {
             abortControllerRef.current.abort();
         }
         setIsLoading(false);
-        setProgress(null);
-        setStatusMessage('Transcription cancelled by user.');
+        setProgressStats(null);
     };
     
     const handleCopy = useCallback(() => {
@@ -393,8 +456,7 @@ export default function Home() {
       setTranscription(null);
       setError(null);
       setIsLoading(false);
-      setProgress(null);
-      setStatusMessage('');
+      setProgressStats(null);
       setCopied(false);
     };
 
@@ -461,7 +523,7 @@ export default function Home() {
 
                     {mode === 'single' && !isLoading && !audioFile && (
                         <div className="flex flex-col items-center justify-center animate-fade-in">
-                             <p className="text-sm text-slate-400 mb-4 text-center">Suitable for long meetings (processed in 12-min chunks with overlap).</p>
+                             <p className="text-sm text-slate-400 mb-4 text-center">Suitable for long meetings (processed in 2-min chunks).</p>
                             <label htmlFor="audio-upload" className="w-full cursor-pointer p-10 border-2 border-dashed border-slate-600 rounded-lg text-center hover:border-sky-500 hover:bg-slate-700/50 transition-colors duration-300">
                                 <UploadIcon className="w-12 h-12 mx-auto text-slate-500 mb-4" />
                                 <span className="text-lg font-semibold text-slate-300">Upload Single File</span>
@@ -581,23 +643,33 @@ export default function Home() {
                         </div>
                     )}
                     
-                    {isLoading && (
-                        <div className="mt-6 text-center text-slate-400 flex flex-col items-center">
-                            <SpinnerIcon className="w-8 h-8 animate-spin text-sky-500" />
-                            <p className="mt-2 font-medium">{statusMessage}</p>
-                            {progress && (
-                                <div className="w-full mt-3">
-                                    <div className="w-full bg-slate-700 rounded-full h-2.5">
-                                        <div 
-                                            className="bg-sky-600 h-2.5 rounded-full transition-all duration-300" 
-                                            style={{ width: `${(progress.current / progress.total) * 100}%` }}>
-                                        </div>
-                                    </div>
-                                    <p className="text-xs mt-1 text-slate-500">
-                                        Processing {progress.current} of {progress.total} {progress.detail ? `(${progress.detail})` : ''}
-                                    </p>
+                    {isLoading && progressStats && (
+                        <div className="mt-6 text-center text-slate-400 flex flex-col items-center animate-fade-in">
+                            <SpinnerIcon className="w-8 h-8 animate-spin text-sky-500 mb-3" />
+                            
+                            <div className="w-full max-w-md">
+                                <div className="flex justify-between text-xs text-slate-300 mb-1">
+                                    <span className="font-semibold uppercase tracking-wider text-sky-400">{progressStats.phase}</span>
+                                    <span>{progressStats.percent}%</span>
                                 </div>
-                            )}
+                                <div className="w-full bg-slate-700 rounded-full h-3 overflow-hidden">
+                                    <div 
+                                        className="bg-sky-600 h-full transition-all duration-500 ease-out" 
+                                        style={{ width: `${progressStats.percent}%` }}>
+                                    </div>
+                                </div>
+                                <div className="flex justify-between text-xs text-slate-500 mt-1">
+                                    <span>
+                                        {progressStats.totalChunks > 0 
+                                            ? `Part ${progressStats.currentChunk} of ${progressStats.totalChunks}`
+                                            : 'Preparing...'}
+                                        {progressStats.detail ? ` - ${progressStats.detail}` : ''}
+                                    </span>
+                                    {progressStats.etaSeconds !== null && (
+                                        <span>~{formatTimeRemaining(progressStats.etaSeconds)} remaining</span>
+                                    )}
+                                </div>
+                            </div>
                         </div>
                     )}
 
